@@ -98,6 +98,9 @@ def load_fsdp_model(
     default_dtype: torch.dtype,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
+    tp_size: int,
+    sp_size: int,
+    num_gpus: int,
     cpu_offload: bool = False,
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.nn.Module:
@@ -111,17 +114,20 @@ def load_fsdp_model(
 
     with set_default_dtype(default_dtype), torch.device("meta"):
         model = model_cls(**init_params)
+    
+    print(f"tp_size: {tp_size}, sp_size: {sp_size}, num_gpus: {num_gpus}")
 
     device_mesh = init_device_mesh(
         "cuda",
         mesh_shape=(get_sequence_model_parallel_world_size(), ),
         mesh_dim_names=("dp", ),
     )
+
     shard_model(model,
                 cpu_offload=cpu_offload,
                 reshard_after_forward=True,
                 mp_policy=mp_policy,
-                dp_mesh=device_mesh["dp"])
+                dp_mesh=device_mesh)
     weight_iterator = safetensors_weights_iterator(weight_dir_list)
     param_names_mapping_fn = get_param_names_mapping(model._param_names_mapping)
     load_fsdp_model_from_full_model_state_dict(

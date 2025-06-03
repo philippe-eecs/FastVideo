@@ -6,6 +6,7 @@ from typing import Any, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 
 from fastvideo.v1.attention import DistributedAttention, LocalAttention
 from fastvideo.v1.configs.models.dits import WanVideoConfig
@@ -431,6 +432,8 @@ class WanTransformer3DModel(CachableDiT):
                     torch.Tensor, List[torch.Tensor]]] = None,
                 guidance=None,
                 **kwargs) -> torch.Tensor:
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"[MODEL WanTransformer3DModel] Input hidden_states shape: {hidden_states.shape}")
         forward_batch = get_forward_context().forward_batch
         enable_teacache = forward_batch is not None and forward_batch.enable_teacache
 
@@ -448,6 +451,8 @@ class WanTransformer3DModel(CachableDiT):
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"[MODEL WanTransformer3DModel] Post-patch calculated dims: T={post_patch_num_frames}, H={post_patch_height}, W={post_patch_width}")
 
         # Get rotary embeddings
         d = self.hidden_size // self.num_attention_heads
@@ -466,7 +471,11 @@ class WanTransformer3DModel(CachableDiT):
                      freqs_sin.float()) if freqs_cos is not None else None
 
         hidden_states = self.patch_embedding(hidden_states)
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"[MODEL WanTransformer3DModel] Shape after patch_embedding: {hidden_states.shape}")
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"[MODEL WanTransformer3DModel] Shape after flatten & transpose: {hidden_states.shape}")
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
             timestep, encoder_hidden_states, encoder_hidden_states_image)
@@ -490,20 +499,23 @@ class WanTransformer3DModel(CachableDiT):
             if enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                for block in self.blocks:
-                    hidden_states = torch.utils.checkpoint.checkpoint(
-                        block,
-                        hidden_states,
-                        encoder_hidden_states,
-                        timestep_proj,
-                        freqs_cis,
-                        use_reentrant=False
-                    )
-            else:
-                for block in self.blocks:
-                    hidden_states = block(hidden_states, encoder_hidden_states,
-                                          timestep_proj, freqs_cis)
+            #if torch.is_grad_enabled() and self.gradient_checkpointing:
+            #    for block in self.blocks:
+            #        hidden_states = torch.utils.checkpoint.checkpoint(
+            #            block,
+            #            hidden_states,
+            #            encoder_hidden_states,
+            #            timestep_proj,
+            #            freqs_cis,
+            #            use_reentrant=False
+            #        )
+            #else:
+            for block_idx, block in enumerate(self.blocks):
+                # print(f"[MODEL WanTransformer3DModel] Shape before block {block_idx}: {hidden_states.shape}")
+                hidden_states = block(hidden_states, encoder_hidden_states,
+                                        timestep_proj, freqs_cis)
+                # if dist.is_initialized() and dist.get_rank() == 0:
+                #     print(f"[MODEL WanTransformer3DModel] Shape after block {block_idx}: {hidden_states.shape}")
 
             # if teacache is enabled, we need to cache the original hidden states
             if enable_teacache:
@@ -512,15 +524,27 @@ class WanTransformer3DModel(CachableDiT):
         # 5. Output norm, projection & unpatchify
         shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2,
                                                                           dim=1)
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"[MODEL WanTransformer3DModel] Shape before norm_out: {hidden_states.shape}")
         hidden_states = self.norm_out(hidden_states.float(), shift, scale)
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"[MODEL WanTransformer3DModel] Shape after norm_out, before proj_out: {hidden_states.shape}")
         hidden_states = self.proj_out(hidden_states)
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"[MODEL WanTransformer3DModel] Shape after proj_out: {hidden_states.shape}")
 
         hidden_states = hidden_states.reshape(batch_size, post_patch_num_frames,
                                               post_patch_height,
                                               post_patch_width, p_t, p_h, p_w,
                                               -1)
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"[MODEL WanTransformer3DModel] Shape after reshape (unpatchify stage 1): {hidden_states.shape}")
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"[MODEL WanTransformer3DModel] Shape after permute (unpatchify stage 2): {hidden_states.shape}")
         output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print(f"[MODEL WanTransformer3DModel] Final output shape: {output.shape}")
 
         return output
 

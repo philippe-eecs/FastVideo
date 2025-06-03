@@ -93,7 +93,11 @@ class WanTrainingPipeline(TrainingPipeline):
                                  dtype=torch.bfloat16)
             encoder_hidden_states = encoder_hidden_states.to(
                 self.training_args.device, dtype=torch.bfloat16)
+            if self.rank == 0:
+                print(f"[RANK {self.rank} - train_one_step] Initial latents shape after to(device): {latents.shape}")
             latents = normalize_dit_input(model_type, latents)
+            if self.rank == 0:
+                print(f"[RANK {self.rank} - train_one_step] Normalized latents shape: {latents.shape}")
             batch_size = latents.shape[0]
             noise = torch.randn_like(latents)
             u = compute_density_for_timestep_sampling(
@@ -119,6 +123,10 @@ class WanTrainingPipeline(TrainingPipeline):
                 dtype=latents.dtype,
             )
             noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
+            if self.rank == 0:
+                print(f"[RANK {self.rank} - train_one_step] noise shape: {noise.shape}")
+            if self.rank == 0:
+                print(f"[RANK {self.rank} - train_one_step] noisy_model_input shape: {noisy_model_input.shape}")
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 input_kwargs = {
                     "hidden_states": noisy_model_input,
@@ -134,11 +142,23 @@ class WanTrainingPipeline(TrainingPipeline):
                         dtype=torch.bfloat16)
                 with set_forward_context(current_timestep=timesteps,
                                          attn_metadata=None):
-                    model_pred = transformer(**input_kwargs)[0]
+                    model_pred = transformer(**input_kwargs)
+                if self.rank == 0:
+                    print(f"[RANK {self.rank} - train_one_step] Raw model_pred shape from transformer: {model_pred.shape}")
 
                 if precondition_outputs:
                     model_pred = noisy_model_input - model_pred * sigmas
+                if self.rank == 0:
+                    print(f"[RANK {self.rank} - train_one_step] Final model_pred shape (after preconditioning if any): {model_pred.shape}")
                 target = latents if precondition_outputs else noise - latents
+                if self.rank == 0:
+                    print(f"[RANK {self.rank} - train_one_step] target shape: {target.shape}")
+
+                # Crop target to match model_pred's predicted dimensions
+                _, _, t_pred, h_pred, w_pred = model_pred.shape
+                target = target[:, :, :t_pred, :h_pred, :w_pred]
+                if self.rank == 0:
+                    print(f"[RANK {self.rank} - train_one_step] Cropped target shape: {target.shape}")
 
                 loss = (torch.mean((model_pred.float() - target.float())**2) /
                         gradient_accumulation_steps)

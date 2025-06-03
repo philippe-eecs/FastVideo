@@ -410,6 +410,9 @@ class TransformerLoader(ComponentLoader):
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             output_dtype=None,
+            tp_size=fastvideo_args.tp_size,
+            sp_size=fastvideo_args.sp_size,
+            num_gpus=fastvideo_args.num_gpus,
         )
         if fastvideo_args.enable_torch_compile:
             logger.info("Torch Compile enabled for DiT")

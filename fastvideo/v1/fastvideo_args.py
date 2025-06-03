@@ -351,11 +351,6 @@ class FastVideoArgs:
         if self.num_gpus < max(self.tp_size, self.sp_size):
             self.num_gpus = max(self.tp_size, self.sp_size)
 
-        if self.tp_size != self.sp_size:
-            raise ValueError(
-                f"tp_size ({self.tp_size}) must be equal to sp_size ({self.sp_size})"
-            )
-
         # Validate VAE spatial parallelism with VAE tiling
         if self.vae_sp and not self.vae_tiling:
             raise ValueError(
