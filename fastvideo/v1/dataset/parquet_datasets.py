@@ -137,18 +137,12 @@ class ParquetVideoTextDataset(Dataset):
         if lat.numel() == 0:  # Validation parquet
             return lat, emb, mask, info
         else:
-            print(lat.shape)
             lat = lat[:, -self.num_latent_t:]
-            print(lat.shape)
-            print(self.sp_world_size)
-            print(self.local_rank)
             if self.sp_world_size > 1:
                 lat = rearrange(lat,
                                 "t (n s) h w -> t n s h w",
                                 n=self.sp_world_size).contiguous()
                 lat = lat[:, self.local_rank, :, :, :]
-            print(lat.shape)
-            assert False
             return lat, emb, mask, info
 
     def _process_row(self, row) -> Dict[str, Any]:
