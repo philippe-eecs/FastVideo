@@ -6,6 +6,13 @@ export FASTVIDEO_ATTENTION_BACKEND=TORCH_SDPA
 DATA_DIR=/fsx-project/philippehansen/datasets/MiraData/try_data/parquet_dataset_distributed
 VALIDATION_DIR=/fsx-project/philippehansen/datasets/MiraData/try_data/parquet_dataset_distributed  # Using same data for now
 NUM_GPUS=8
+# Tensor and sequence parallel sizes must be set so that both the
+# hidden dimension (for TP) and the number of attention heads (for SP)
+# divide evenly across ranks.  Wan 1.3B uses 96 attention heads, so we
+# choose an sp_size of 4 to avoid the reshape error in the attention
+# all-to-all step.
+TP_SIZE=4
+SP_SIZE=4
 
 # Checkpoint path (uncomment to resume from checkpoint)
 # CHECKPOINT_PATH="$DATA_DIR/outputs/wan_finetune/checkpoint-50"
@@ -21,8 +28,8 @@ torchrun --nnodes 1 --nproc_per_node $NUM_GPUS \
     --validation_prompt_dir "$VALIDATION_DIR" \
     --train_batch_size=1 \
     --num_latent_t 20 \
-    --sp_size $NUM_GPUS \
-    --tp_size $NUM_GPUS \
+    --sp_size $SP_SIZE \
+    --tp_size $TP_SIZE \
     --train_sp_batch_size 1 \
     --dataloader_num_workers 4 \
     --gradient_accumulation_steps=1 \
