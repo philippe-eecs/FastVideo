@@ -218,6 +218,11 @@ class WanTrainingPipeline(TrainingPipeline):
         # print dtype
         logger.info("  Master weight dtype: %s",
                     self.transformer.parameters().__next__().dtype)
+        
+        # Log gradient checkpointing status
+        if hasattr(self.transformer, 'gradient_checkpointing'):
+            logger.info("  Gradient checkpointing: %s", 
+                       "ENABLED" if self.transformer.gradient_checkpointing else "DISABLED")
 
         if self.training_args.resume_from_checkpoint:
             logger.info("Loading checkpoint from %s",

@@ -52,6 +52,14 @@ class TrainingPipeline(ComposedPipelineBase, ABC):
         self.transformer = self.get_module("transformer")
         assert self.transformer is not None
 
+        # Enable gradient checkpointing if requested
+        if training_args.gradient_checkpointing:
+            if hasattr(self.transformer, 'enable_gradient_checkpointing'):
+                self.transformer.enable_gradient_checkpointing()
+                logger.info("Gradient checkpointing enabled for transformer")
+            else:
+                logger.warning("Transformer does not support gradient checkpointing")
+
         self.transformer.requires_grad_(True)
         self.transformer.train()
 
@@ -63,7 +71,7 @@ class TrainingPipeline(ComposedPipelineBase, ABC):
         self.optimizer = torch.optim.AdamW(
             params_to_optimize,
             lr=training_args.learning_rate,
-            betas=(0.9, 0.999),
+            betas=(0.9, 0.95),
             weight_decay=training_args.weight_decay,
             eps=1e-8,
         )

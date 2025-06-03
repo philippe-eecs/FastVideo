@@ -417,6 +417,12 @@ class WanTransformer3DModel(CachableDiT):
 
         self.__post_init__()
 
+    def enable_gradient_checkpointing(self):
+        """
+        Enable gradient checkpointing to reduce memory usage during training.
+        """
+        self.gradient_checkpointing = True
+
     def forward(self,
                 hidden_states: torch.Tensor,
                 encoder_hidden_states: Union[torch.Tensor, List[torch.Tensor]],
@@ -486,9 +492,14 @@ class WanTransformer3DModel(CachableDiT):
 
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 for block in self.blocks:
-                    hidden_states = self._gradient_checkpointing_func(
-                        block, hidden_states, encoder_hidden_states,
-                        timestep_proj, freqs_cis)
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        block,
+                        hidden_states,
+                        encoder_hidden_states,
+                        timestep_proj,
+                        freqs_cis,
+                        use_reentrant=False
+                    )
             else:
                 for block in self.blocks:
                     hidden_states = block(hidden_states, encoder_hidden_states,
