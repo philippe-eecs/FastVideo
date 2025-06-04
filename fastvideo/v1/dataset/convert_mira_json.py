@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torchvision.io
+import torchvision.transforms.functional as TF
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
@@ -16,6 +17,10 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 # If VAELoader loads a custom VAE, AutoencoderKL import might not be directly needed here
 # but often part of the ecosystem.
 from diffusers import AutoencoderKL
+import concurrent.futures
+from torch.utils.data import Dataset, DataLoader
+from functools import partial
+import time
 
 from fastvideo.v1.logger import init_logger
 from fastvideo.v1.configs.models.vaes import WanVAEConfig
@@ -26,180 +31,180 @@ from fastvideo.v1.dataset.dataloader.schema import pyarrow_schema
 
 logger = init_logger(__name__)
 
-def setup_distributed(rank, world_size):
-    """Initialize distributed processing."""
+def get_video_metadata(video_path: str) -> dict:
+    """Get video metadata using ffprobe."""
+    cmd = [
+        'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height,r_frame_rate,nb_frames:format=duration',
+        '-of', 'json', video_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    data = json.loads(result.stdout)
+    if not data.get('streams') or not data.get('format'):
+        raise ValueError(f"No stream/format in ffprobe output for {video_path}")
+    
+    stream = data['streams'][0]
+    format_info = data['format']
+    
+    # Parse frame rate
+    fps_str = stream.get('r_frame_rate', '30/1')
+    fps_parts = fps_str.split('/')
+    fps = float(fps_parts[0]) / float(fps_parts[1])
+    
+    return {
+        "fps": fps,
+        "duration_sec": float(format_info.get('duration', 0.0)),
+        "width": int(stream['width']),
+        "height": int(stream['height']),
+        "num_frames": int(stream.get('nb_frames', 0))
+    }
+
+def write_batch_to_parquet(batch_data: list, output_dir: str, batch_num: int, rank: int = 0):
+    """Write batch to parquet with rank suffix to avoid conflicts."""
+    table = pa.Table.from_pylist(batch_data, schema=pyarrow_schema)
+    output_path = os.path.join(output_dir, f"data_chunk_rank{rank:02d}_{batch_num:04d}.parquet")
+    pq.write_table(table, output_path, compression='zstd')
+    logger.info(f"Rank {rank} wrote batch {batch_num} to {output_path}")
+
+def preprocess_video(video_path: str, target_frames: int = 81, frame_sample_rate: int = 4, target_height: int = 480, target_width: int = 832):
+    """Load and preprocess a single video (no VAE encoding)."""
+    # Load video
+    video_frames, _, _ = torchvision.io.read_video(video_path, pts_unit='sec', output_format="TCHW")
+
+    # Get original dimensions
+    original_height, original_width = video_frames.shape[2], video_frames.shape[3]
+
+    # Calculate scaling ratio to fit within target dimensions while maintaining aspect ratio
+    height_ratio = target_height / original_height
+    width_ratio = target_width / original_width
+    scale_ratio = min(height_ratio, width_ratio)
+
+    # Calculate new dimensions after scaling (ceil to avoid undersizing)
+    scaled_height = int(np.ceil(original_height * scale_ratio))
+    scaled_width = int(np.ceil(original_width * scale_ratio))
+
+    # Resize all frames in one go (video_frames: T, C, H, W)
+    video_frames = TF.resize(video_frames, [scaled_height, scaled_width], antialias=True)
+    # Center crop to exact target size
+    video_frames = TF.center_crop(video_frames, [target_height, target_width])
+
+    # Assert shape is correct after crop
+    assert video_frames.shape[2] == target_height and video_frames.shape[3] == target_width, \
+        f"Resized video shape {video_frames.shape[2:]} does not match target ({target_height}, {target_width})"
+
+    # Sample frames
+    if frame_sample_rate > 1:
+        indices = torch.arange(0, video_frames.shape[0], frame_sample_rate).long()
+        video_frames = video_frames[indices]
+
+    # Pad or sample to target frames
+    current_frames = video_frames.shape[0]
+    if current_frames > target_frames:
+        indices = torch.linspace(0, current_frames - 1, target_frames).long()
+        video_frames = video_frames[indices][:target_frames]
+    elif current_frames < target_frames:
+        pad_size = target_frames - current_frames
+        last_frame = video_frames[-1:].repeat(pad_size, 1, 1, 1)
+        video_frames = torch.cat([video_frames, last_frame], dim=0)
+
+    # Assert frame count
+    assert video_frames.shape[0] == target_frames, f"Video has {video_frames.shape[0]} frames, expected {target_frames}"
+
+    # Normalize
+    video_frames = video_frames.float() / 127.5 - 1.0
+    video_frames = video_frames.permute(1, 0, 2, 3).contiguous()
+
+    return video_frames, target_height, target_width
+
+class VideoPreprocessDataset(Dataset):
+    def __init__(self, valid_entries, args, tokenizer):
+        self.valid_entries = valid_entries
+        self.args = args
+        self.tokenizer = tokenizer
+    def __len__(self):
+        return len(self.valid_entries)
+    def __getitem__(self, idx):
+        entry = self.valid_entries[idx]
+        video_path = entry['video_path']
+        caption = entry['caption']
+        index = entry['idx']
+        video_frames, new_height, new_width = preprocess_video(
+            video_path,
+            target_frames=self.args.target_frames,
+            frame_sample_rate=self.args.frame_sample_rate,
+            target_height=self.args.height,
+            target_width=self.args.width
+        )
+        tokenized = self.tokenizer(
+            caption,
+            padding='max_length',
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+            return_tensors='pt'
+        )
+        return {
+            'video_frames': video_frames,
+            'new_height': new_height,
+            'new_width': new_width,
+            'entry': entry,
+            'idx': index,
+            'caption': caption,
+            'video_path': video_path,
+            'input_ids': tokenized['input_ids'].squeeze(0),
+            'attention_mask': tokenized['attention_mask'].squeeze(0),
+        }
+
+def distributed_worker(rank: int, world_size: int, args):
+    """Worker function for distributed processing."""
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-def cleanup_distributed():
-    """Clean up distributed processing."""
-    dist.destroy_process_group()
-
-def get_video_metadata(video_path: str) -> dict:
-    """Get video metadata using ffprobe."""
-    try:
-        cmd = [
-            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height,r_frame_rate,nb_frames:format=duration',
-            '-of', 'json', video_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout)
-        if not data.get('streams') or not data.get('format'):
-            raise ValueError(f"No stream/format in ffprobe output for {video_path}")
-        
-        stream = data['streams'][0]
-        format_info = data['format']
-        
-        # Parse frame rate
-        fps_str = stream.get('r_frame_rate', '30/1')
-        fps_parts = fps_str.split('/')
-        fps = float(fps_parts[0]) / float(fps_parts[1])
-        
-        return {
-            "fps": fps,
-            "duration_sec": float(format_info.get('duration', 0.0)),
-            "width": int(stream['width']),
-            "height": int(stream['height']),
-            "num_frames": int(stream.get('nb_frames', 0))
-        }
-    except Exception as e:
-        logger.warning(f"Metadata extraction failed for {video_path}: {e}")
-        # Return default values
-        return {
-            "fps": 30.0,
-            "duration_sec": 0.0,
-            "width": 640,
-            "height": 480,
-            "num_frames": 0
-        }
-
-def process_video(video_path: str, vae, device, target_frames: int = 81, frame_sample_rate: int = 4):
-    """Load and process a single video through VAE."""
-    try:
-        # Load video
-        video_frames, _, _ = torchvision.io.read_video(video_path, pts_unit='sec', output_format="TCHW")
-        if video_frames.shape[0] == 0:
-            return None
-        
-        # Sample frames
-        if frame_sample_rate > 1:
-            indices = torch.arange(0, video_frames.shape[0], frame_sample_rate).long()
-            video_frames = video_frames[indices]
-        
-        # Pad or sample to target frames
-        current_frames = video_frames.shape[0]
-        if current_frames > target_frames:
-            indices = torch.linspace(0, current_frames - 1, target_frames).long()
-            video_frames = video_frames[indices]
-        elif current_frames < target_frames:
-            pad_size = target_frames - current_frames
-            last_frame = video_frames[-1:].repeat(pad_size, 1, 1, 1)
-            video_frames = torch.cat([video_frames, last_frame], dim=0)
-        
-        # Normalize
-        video_frames = video_frames.float() / 127.5 - 1.0
-        
-        # Process through VAE
-        # video_frames is (T, C, H, W), need (B=1, C, T, H, W) for VAE
-        video_tensor = video_frames.permute(1, 0, 2, 3).unsqueeze(0).to(device)
-        
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
-            latents = vae.encode(video_tensor).sample()
-        
-        # latents is (1, LatentC, T_lat, H_lat, W_lat)
-        return latents[0].cpu()
-        
-    except Exception as e:
-        logger.error(f"Error processing video {video_path}: {e}")
-        return None
-
-def process_text(caption: str, tokenizer, text_encoder, device):
-    """Process text through tokenizer and encoder."""
-    try:
-        inputs = tokenizer(
-            caption,
-            padding="max_length",
-            max_length=512,
-            truncation=True,
-            return_tensors="pt"
-        )
-        
-        input_ids = inputs["input_ids"].to(device)
-        attention_mask = inputs["attention_mask"].to(device)
-        
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
-            outputs = text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-            embeddings = outputs.last_hidden_state
-        
-        return embeddings[0].cpu(), attention_mask[0].cpu()
-        
-    except Exception as e:
-        logger.error(f"Error processing text: {e}")
-        return None, None
-
-def write_batch_to_parquet(batch_data: list, output_dir: str, batch_num: int, rank: int = 0):
-    """Write batch to parquet with rank suffix to avoid conflicts."""
-    if not batch_data:
-        return
-    try:
-        table = pa.Table.from_pylist(batch_data, schema=pyarrow_schema)
-        output_path = os.path.join(output_dir, f"data_chunk_rank{rank:02d}_{batch_num:04d}.parquet")
-        pq.write_table(table, output_path, compression='zstd')
-        logger.info(f"Rank {rank} wrote batch {batch_num} to {output_path}")
-    except Exception as e:
-        logger.error(f"Rank {rank} parquet writing error for batch {batch_num}: {e}")
-
-def distributed_worker(rank: int, world_size: int, args):
-    """Worker function for distributed processing."""
-    setup_distributed(rank, world_size)
     device = f"cuda:{rank}"
     logger.info(f"Worker {rank}/{world_size} starting on {device}")
     
+    # --- Timing: Model Loading ---
+    t0 = time.time()
     # Load models
-    try:
-        # Load VAE
-        vae_model_path = os.path.join(args.model_path, "vae")
-        vae_config = WanVAEConfig(load_encoder=True, load_decoder=False)
-        fv_args = FastVideoArgs(
-            model_path=vae_model_path,
-            vae_config=vae_config,
-            vae_precision="fp32"
-        )
-        fv_args.device = device
-        vae = VAELoader().load(
-            model_path=vae_model_path,
-            architecture="",
-            fastvideo_args=fv_args
-        )
-        vae.eval()
-        
-        # Load tokenizer
-        tokenizer_path = os.path.join(args.model_path, "tokenizer")
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_path,
-            padding_side="right",
-            model_max_length=512
-        )
-        
-        # Load text encoder
-        text_encoder_path = os.path.join(args.model_path, "text_encoder")
-        text_encoder = UMT5EncoderModel.from_pretrained(text_encoder_path).to(device)
-        text_encoder.eval()
-        
-        logger.info(f"Rank {rank}: All models loaded successfully")
-        
-    except Exception as e:
-        logger.error(f"Rank {rank}: Model loading failed: {e}")
-        cleanup_distributed()
-        return
+    vae_model_path = os.path.join(args.model_path, "vae")
+    vae_config = WanVAEConfig(load_encoder=True, load_decoder=False)
+    fv_args = FastVideoArgs(
+        model_path=vae_model_path,
+        vae_config=vae_config,
+        vae_precision="bf16"
+    )
+    fv_args.device = device
+    vae = VAELoader().load(
+        model_path=vae_model_path,
+        architecture="",
+        fastvideo_args=fv_args
+    )
+    # Move to GPU and convert to bfloat16
+    vae = vae.to(device).to(torch.bfloat16)
+    # Compile for speed
+    vae = torch.compile(vae, mode="max-autotune", fullgraph=True)
+    vae.eval()
+    tokenizer_path = os.path.join(args.model_path, "tokenizer")
+    global tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        padding_side="right",
+        model_max_length=512
+    )
+    text_encoder_path = os.path.join(args.model_path, "text_encoder")
+    text_encoder = UMT5EncoderModel.from_pretrained(text_encoder_path).to(device)
+    text_encoder.eval()
+    t1 = time.time()
+    logger.info(f"Rank {rank}: All models loaded successfully in {t1-t0:.2f} seconds")
     
-    # Read CSV and count total rows
+    # --- Timing: CSV Reading ---
+    t_csv_start = time.time()
     with open(args.csv_path, 'r', encoding='utf-8-sig') as csvfile:
         reader = list(csv.DictReader(csvfile))
         total_rows = len(reader)
+    t_csv_end = time.time()
+    logger.info(f"Rank {rank}: CSV read in {t_csv_end-t_csv_start:.2f} seconds, {total_rows} rows")
     
     # Calculate this rank's portion
     rows_per_rank = total_rows // world_size
@@ -232,12 +237,20 @@ def distributed_worker(rank: int, world_size: int, args):
             })
         else:
             missing_count += 1
+        
+        if idx < start_idx + 5:
+            logger.info(f"Rank {rank}: Checking video path: {video_path} (exists: {os.path.exists(video_path)})")
     
     logger.info(f"Rank {rank}: Found {len(valid_entries)} valid videos, {missing_count} missing videos")
     
+    # Limit number of videos per process if requested
+    if args.max_videos is not None:
+        valid_entries = valid_entries[:args.max_videos]
+        logger.info(f"Rank {rank}: Limiting to {len(valid_entries)} videos for test run (--max_videos)")
+
     if not valid_entries:
         logger.warning(f"Rank {rank}: No valid videos found, exiting")
-        cleanup_distributed()
+        dist.destroy_process_group()
         return
     
     # Process valid entries
@@ -247,69 +260,95 @@ def distributed_worker(rank: int, world_size: int, args):
     # Create output directory (all ranks can do this safely)
     os.makedirs(args.output_dir, exist_ok=True)
     
-    for entry in tqdm(valid_entries, desc=f"Rank {rank}", position=rank):
-        video_path = entry['video_path']
-        caption = entry['caption']
-        idx = entry['idx']
-        
-        # Process video
-        latents = process_video(
-            video_path, vae, device,
-            args.target_frames, args.frame_sample_rate
-        )
-        if latents is None:
-            logger.warning(f"Rank {rank}: Failed to process video {video_path}")
-            continue
-        
-        # Process text
-        text_emb, text_mask = process_text(caption, tokenizer, text_encoder, device)
-        if text_emb is None or text_mask is None:
-            logger.warning(f"Rank {rank}: Failed to process text for {video_path}")
-            continue
-        
-        # Get metadata
-        metadata = get_video_metadata(video_path)
-        
-        # Create record
-        record = {
-            "id": os.path.splitext(entry['basename'])[0] + f"_{idx}",
-            "file_name": entry['basename'],
-            "caption": caption,
-            "media_type": "video",
-            "width": metadata["width"],
-            "height": metadata["height"],
-            "fps": metadata["fps"],
-            "duration_sec": metadata["duration_sec"],
-            "num_frames": metadata["num_frames"],
-            "vae_latent_bytes": latents.numpy().tobytes(),
-            "vae_latent_shape": list(latents.shape),
-            "vae_latent_dtype": str(latents.dtype).replace("torch.", ""),
-            "text_embedding_bytes": text_emb.numpy().tobytes(),
-            "text_embedding_shape": list(text_emb.shape),
-            "text_embedding_dtype": str(text_emb.dtype).replace("torch.", ""),
-            "text_attention_mask_bytes": text_mask.numpy().astype(np.uint8).tobytes(),
-            "text_attention_mask_shape": list(text_mask.shape),
-            "text_attention_mask_dtype": "uint8",
-        }
-        
-        local_records.append(record)
-        
-        # Write parquet file when batch size is reached
+    video_dataset = VideoPreprocessDataset(valid_entries, args, tokenizer)
+    video_loader = DataLoader(
+        video_dataset,
+        batch_size=args.vae_batch_size,
+        num_workers=args.preprocess_workers,
+        shuffle=False,
+        pin_memory=True
+    )
+
+    processed_videos = 0
+    for batch in tqdm(video_loader, desc=f"Rank {rank} DataLoader", position=rank):
+        batch_start = time.time()
+        video_tensor_batch = batch['video_frames'].to(device, dtype=torch.bfloat16)
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        caption = batch['caption']
+        video_path = batch['video_path']
+        new_height = batch['new_height']
+        new_width = batch['new_width']
+        entry = batch['entry']
+        # Ensure entry is always a list of dicts
+        # --- Timing: VAE Encoding ---
+        vae_start = time.time()
+        with torch.inference_mode(), torch.amp.autocast(enabled=True, dtype=torch.bfloat16, device_type='cuda'):
+            latents_batch = vae.encode(video_tensor_batch).sample().cpu()
+        vae_end = time.time()
+        logger.info(f"Rank {rank}: VAE encoding for batch took {vae_end-vae_start:.2f} seconds")
+        # --- Timing: Text Encoding ---
+        text_start = time.time()
+        with torch.no_grad(), torch.amp.autocast(enabled=True, device_type='cuda'):
+            outputs = text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+            text_emb = outputs.last_hidden_state.cpu()
+            text_mask = attention_mask.cpu()
+        text_end = time.time()
+        logger.info(f"Rank {rank}: Text encoding for batch took {text_end-text_start:.2f} seconds")
+        # --- Timing: Metadata and Record Creation ---
+        meta_start = time.time()
+        for i in range(len(caption)):
+            metadata = get_video_metadata(video_path[i])
+            record = {
+                "file_name": entry['basename'][i],
+                "video_path": entry['video_path'][i],
+                "caption": caption[i],
+                "media_type": "video",
+                "width": new_width[i],
+                "height": new_height[i],
+                "fps": metadata["fps"],
+                "duration_sec": metadata["duration_sec"],
+                "num_frames": metadata["num_frames"],
+                "vae_latent_bytes": latents_batch[i].numpy().tobytes(),
+                "vae_latent_shape": list(latents_batch[i].shape),
+                "vae_latent_dtype": str(latents_batch[i].dtype).replace("torch.", ""),
+                "text_embedding_bytes": text_emb[i].numpy().tobytes(),
+                "text_embedding_shape": list(text_emb[i].shape),
+                "text_embedding_dtype": str(text_emb[i].dtype).replace("torch.", ""),
+                "text_attention_mask_bytes": text_mask[i].numpy().astype(np.uint8).tobytes(),
+                "text_attention_mask_shape": list(text_mask[i].shape),
+                "text_attention_mask_dtype": "uint8",
+            }
+            local_records.append(record)
+        meta_end = time.time()
+        logger.info(f"Rank {rank}: Metadata/record creation for batch took {meta_end-meta_start:.2f} seconds")
+        # --- Timing: Parquet Writing ---
         if len(local_records) >= args.parquet_batch_size:
+            parquet_start = time.time()
             write_batch_to_parquet(local_records, args.output_dir, batch_num, rank)
+            parquet_end = time.time()
+            logger.info(f"Rank {rank}: Parquet writing for batch took {parquet_end-parquet_start:.2f} seconds")
             local_records = []
             batch_num += 1
-    
-    # Write any remaining records
+        batch_end = time.time()
+        logger.info(f"Rank {rank}: Total batch time: {batch_end-batch_start:.2f} seconds")
+        batch_size = len(caption)
+        processed_videos += batch_size
+        if args.max_videos is not None and processed_videos >= args.max_videos:
+            logger.info(f"Rank {rank}: Reached max_videos ({args.max_videos}), stopping early.")
+            break
+    # After the loop, write any remaining records
     if local_records:
+        parquet_start = time.time()
         write_batch_to_parquet(local_records, args.output_dir, batch_num, rank)
-    
+        parquet_end = time.time()
+        logger.info(f"Rank {rank}: Parquet writing for final batch took {parquet_end-parquet_start:.2f} seconds")
+
     logger.info(f"Rank {rank}: Successfully processed {len(valid_entries)} videos")
     
     # Wait for all processes to complete before exiting
     dist.barrier()
-    
-    cleanup_distributed()
+    dist.destroy_process_group()
 
 def main(args):
     """Main function that spawns distributed workers."""
@@ -342,6 +381,10 @@ if __name__ == '__main__':
                        help="CSV column containing video paths")
     parser.add_argument("--caption_column", type=str, default="dense_caption",
                        help="CSV column containing captions")
+    parser.add_argument("--height", type=int, default=480,
+                       help="Height of the video")
+    parser.add_argument("--width", type=int, default=832,
+                       help="Width of the video")
     parser.add_argument("--parquet_batch_size", type=int, default=128,
                        help="Records per parquet file")
     parser.add_argument("--target_frames", type=int, default=81,
@@ -350,6 +393,9 @@ if __name__ == '__main__':
                        help="Frame sampling rate")
     parser.add_argument("--num_gpus", type=int, default=0,
                        help="Number of GPUs to use (0=all)")
+    parser.add_argument("--vae_batch_size", type=int, default=4, help="Batch size for VAE encoding")
+    parser.add_argument("--preprocess_workers", type=int, default=2, help="Number of threads for video preprocessing")
+    parser.add_argument("--max_videos", type=int, default=None, help="Maximum number of videos to process per process (for testing)")
     
     args = parser.parse_args()
     main(args) 

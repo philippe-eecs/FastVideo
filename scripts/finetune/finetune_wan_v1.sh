@@ -3,8 +3,8 @@
 export FASTVIDEO_ATTENTION_BACKEND=TORCH_SDPA
 
 # Update paths to match your parquet dataset
-DATA_DIR=/fsx-project/philippehansen/datasets/MiraData/try_data/parquet_dataset_distributed
-VALIDATION_DIR=/fsx-project/philippehansen/datasets/MiraData/try_data/parquet_dataset_distributed  # Using same data for now
+DATA_DIR=/fsx-project/philippehansen/datasets/MiraData/try_data/parquet_dataset_test
+VALIDATION_DIR=/fsx-project/philippehansen/datasets/MiraData/try_data/parquet_dataset_test  # Using same data for now
 NUM_GPUS=8
 # Tensor and sequence parallel sizes must be set so that both the
 # hidden dimension (for TP) and the number of attention heads (for SP)
@@ -28,8 +28,10 @@ torchrun --nnodes 1 --nproc_per_node $NUM_GPUS \
     --validation_prompt_dir "$VALIDATION_DIR" \
     --train_batch_size=1 \
     --num_latent_t 16 \
-    --sp-size $NUM_GPUS \
-    --tp-size $NUM_GPUS \
+    --dp_size 2 \
+    --dp_shards 4 \
+    --sp_size 4 \
+    --tp_size 1 \
     --train_sp_batch_size 1 \
     --dataloader_num_workers 4 \
     --gradient_accumulation_steps=1 \

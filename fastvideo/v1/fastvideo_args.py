@@ -623,7 +623,7 @@ class TrainingArgs(FastVideoArgs):
         # Diffusion settings
         parser.add_argument("--ema-decay",
                             type=float,
-                            default=0.999,
+                            default=0.9999,
                             help="EMA decay rate")
         parser.add_argument("--ema-start-step",
                             type=int,

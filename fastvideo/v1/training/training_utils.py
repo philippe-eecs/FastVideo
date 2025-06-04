@@ -245,7 +245,9 @@ def normalize_dit_input(model_type, latents, args=None) -> torch.Tensor:
         latents_mean = latents_mean.view(1, -1, 1, 1,
                                          1).to(device=latents.device)
         latents_std = latents_std.view(1, -1, 1, 1, 1).to(device=latents.device)
+        print(f"[normalize_dit_input] Before normalization - latents.shape: {latents.shape}, latents_mean.shape: {latents_mean.shape}, latents_std.shape: {latents_std.shape}")
         latents = ((latents.float() - latents_mean) * latents_std).to(latents)
+        print(f"[normalize_dit_input] After normalization - latents.shape: {latents.shape}")
         return latents
     else:
         raise NotImplementedError(f"model_type {model_type} not supported")
