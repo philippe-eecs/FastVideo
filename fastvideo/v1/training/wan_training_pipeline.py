@@ -31,6 +31,9 @@ logger = init_logger(__name__)
 # Manual gradient checking flag - set to True to enable gradient verification
 ENABLE_GRADIENT_CHECK = False
 
+def check_nans(tensor, name, rank):
+    if torch.isnan(tensor).any():
+        print(f"[RANK {rank}] WARNING: NaNs detected in {name} (shape: {tensor.shape})")
 
 class WanTrainingPipeline(TrainingPipeline):
     """
@@ -184,6 +187,23 @@ class WanTrainingPipeline(TrainingPipeline):
             world_group = get_world_group()
             world_group.all_reduce(avg_loss, op=torch.distributed.ReduceOp.AVG)
             total_loss += avg_loss.item()
+
+            # After normalization
+            check_nans(latents, "latents (after normalization)", self.rank)
+            # After noise creation
+            check_nans(noise, "noise", self.rank)
+            # After noisy_model_input
+            check_nans(noisy_model_input, "noisy_model_input", self.rank)
+            # After model_pred (after forward)
+            check_nans(model_pred, "model_pred (after forward)", self.rank)
+            # After target creation
+            check_nans(target, "target", self.rank)
+            # After loss computation
+            check_nans(loss, "loss", self.rank)
+            # After loss.backward(), check gradients
+            for name, param in transformer.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"[RANK {self.rank}] WARNING: NaNs detected in gradient of {name} (shape: {param.grad.shape})")
 
         # TODO(will): perhaps move this into transformer api so that we can do
         # the following:

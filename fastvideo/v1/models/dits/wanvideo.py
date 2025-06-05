@@ -29,6 +29,11 @@ from fastvideo.v1.models.dits.base import CachableDiT
 from fastvideo.v1.platforms import _Backend
 
 
+def check_nans(tensor, name, rank):
+    if torch.isnan(tensor).any():
+        print(f"[WANVIDEO][RANK {rank}] WARNING: NaNs detected in {name} (shape: {tensor.shape})")
+
+
 class WanImageEmbedding(torch.nn.Module):
 
     def __init__(self, in_features: int, out_features: int):
@@ -477,6 +482,8 @@ class WanTransformer3DModel(CachableDiT):
         if dist.is_initialized() and dist.get_rank() == 0:
             print(f"[MODEL WanTransformer3DModel] Shape after flatten & transpose: {hidden_states.shape}")
 
+        check_nans(hidden_states, "hidden_states (after patch_embedding)", dist.get_rank() if dist.is_initialized() else 0)
+
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
             timestep, encoder_hidden_states, encoder_hidden_states_image)
         timestep_proj = timestep_proj.unflatten(1, (6, -1))
@@ -517,6 +524,8 @@ class WanTransformer3DModel(CachableDiT):
                 # if dist.is_initialized() and dist.get_rank() == 0:
                 #     print(f"[MODEL WanTransformer3DModel] Shape after block {block_idx}: {hidden_states.shape}")
 
+                check_nans(hidden_states, f"hidden_states (after block {block_idx})", dist.get_rank() if dist.is_initialized() else 0)
+
             # if teacache is enabled, we need to cache the original hidden states
             if enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
@@ -533,6 +542,9 @@ class WanTransformer3DModel(CachableDiT):
         if dist.is_initialized() and dist.get_rank() == 0:
             print(f"[MODEL WanTransformer3DModel] Shape after proj_out: {hidden_states.shape}")
 
+        check_nans(hidden_states, "hidden_states (after norm_out)", dist.get_rank() if dist.is_initialized() else 0)
+        check_nans(hidden_states, "hidden_states (after proj_out)", dist.get_rank() if dist.is_initialized() else 0)
+
         hidden_states = hidden_states.reshape(batch_size, post_patch_num_frames,
                                               post_patch_height,
                                               post_patch_width, p_t, p_h, p_w,
@@ -545,6 +557,8 @@ class WanTransformer3DModel(CachableDiT):
         output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
         if dist.is_initialized() and dist.get_rank() == 0:
             print(f"[MODEL WanTransformer3DModel] Final output shape: {output.shape}")
+
+        check_nans(output, "output (final output)", dist.get_rank() if dist.is_initialized() else 0)
 
         return output
 
