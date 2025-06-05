@@ -32,9 +32,15 @@ logger = init_logger(__name__)
 ENABLE_GRADIENT_CHECK = False
 
 def check_nans(tensor, name, rank):
-    if torch.isnan(tensor).any():
+    if torch.isnan(tensor).any(): d
         print(f"[RANK {rank}] WARNING: NaNs detected in {name} (shape: {tensor.shape})")
         raise RuntimeError(f"[RANK {rank}] NaNs detected in {name} (shape: {tensor.shape})")
+
+def check_model_params_for_nans(model, rank):
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any():
+            print(f"[RANK {rank}] WARNING: NaNs detected in parameter {name} (shape: {param.shape})")
+            raise RuntimeError(f"[RANK {rank}] NaNs detected in parameter {name} (shape: {param.shape})")
 
 class WanTrainingPipeline(TrainingPipeline):
     """
@@ -100,6 +106,12 @@ class WanTrainingPipeline(TrainingPipeline):
                 batch = next(self.train_loader_iter)
 
             latents, encoder_hidden_states, encoder_attention_mask, infos = batch
+
+            check_nans(latents, "latents (input batch)", self.rank)
+            check_nans(encoder_hidden_states, "encoder_hidden_states (input batch)", self.rank)
+            check_nans(encoder_attention_mask, "encoder_attention_mask (input batch)", self.rank)
+            if isinstance(infos, torch.Tensor):
+                check_nans(infos, "infos (input batch)", self.rank)
 
             # logger.info("rank: %s, caption: %s",
             #             self.rank,

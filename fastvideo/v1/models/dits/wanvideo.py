@@ -301,6 +301,8 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        check_nans(hidden_states, "block input", rank)
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
@@ -314,9 +316,13 @@ class WanTransformerBlock(nn.Module):
         # 1. Self-attention
         norm_hidden_states = (self.norm1(hidden_states.float()) *
                               (1 + scale_msa) + shift_msa).to(orig_dtype)
+        check_nans(norm_hidden_states, "after norm1", rank)
         query, _ = self.to_q(norm_hidden_states)
+        check_nans(query, "after to_q", rank)
         key, _ = self.to_k(norm_hidden_states)
+        check_nans(key, "after to_k", rank)
         value, _ = self.to_v(norm_hidden_states)
+        check_nans(value, "after to_v", rank)
 
         if self.norm_q is not None:
             query = self.norm_q.forward_native(query)
@@ -334,6 +340,7 @@ class WanTransformerBlock(nn.Module):
                                            key, cos, sin, is_neox_style=False)
 
         attn_output, _ = self.attn1(query, key, value)
+        check_nans(attn_output, "after self-attn", rank)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -343,20 +350,25 @@ class WanTransformerBlock(nn.Module):
             hidden_states, attn_output, gate_msa, null_shift, null_scale)
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype), hidden_states.to(orig_dtype)
+        check_nans(hidden_states, "after self_attn_residual_norm", rank)
 
         # 2. Cross-attention
         attn_output = self.attn2(norm_hidden_states,
                                  context=encoder_hidden_states,
                                  context_lens=None)
+        check_nans(attn_output, "after cross-attn", rank)
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa)
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype), hidden_states.to(orig_dtype)
+        check_nans(hidden_states, "after cross_attn_residual_norm", rank)
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
+        check_nans(ff_output, "after ffn", rank)
         hidden_states = self.mlp_residual(hidden_states, ff_output, c_gate_msa)
         hidden_states = hidden_states.to(orig_dtype)
+        check_nans(hidden_states, "after mlp_residual", rank)
 
         return hidden_states
 
