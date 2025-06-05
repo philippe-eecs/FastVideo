@@ -32,6 +32,7 @@ from fastvideo.v1.platforms import _Backend
 def check_nans(tensor, name, rank):
     if torch.isnan(tensor).any():
         print(f"[WANVIDEO][RANK {rank}] WARNING: NaNs detected in {name} (shape: {tensor.shape})")
+        raise RuntimeError(f"[WANVIDEO][RANK {rank}] NaNs detected in {name} (shape: {tensor.shape})")
 
 
 class WanImageEmbedding(torch.nn.Module):

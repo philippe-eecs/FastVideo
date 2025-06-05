@@ -34,6 +34,7 @@ ENABLE_GRADIENT_CHECK = False
 def check_nans(tensor, name, rank):
     if torch.isnan(tensor).any():
         print(f"[RANK {rank}] WARNING: NaNs detected in {name} (shape: {tensor.shape})")
+        raise RuntimeError(f"[RANK {rank}] NaNs detected in {name} (shape: {tensor.shape})")
 
 class WanTrainingPipeline(TrainingPipeline):
     """
