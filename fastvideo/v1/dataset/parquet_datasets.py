@@ -23,6 +23,27 @@ from fastvideo.v1.logger import init_logger
 logger = init_logger(__name__)
 
 
+def check_nans(tensor, name, idx=None, file_path=None):
+    if isinstance(tensor, np.ndarray):
+        if np.isnan(tensor).any():
+            msg = f"NaNs detected in {name}"
+            if idx is not None:
+                msg += f" at row {idx}"
+            if file_path is not None:
+                msg += f" in file {file_path}"
+            print(msg)
+            raise RuntimeError(msg)
+    elif hasattr(tensor, 'isnan') and callable(getattr(tensor, 'isnan')):
+        if tensor.isnan().any():
+            msg = f"NaNs detected in {name}"
+            if idx is not None:
+                msg += f" at row {idx}"
+            if file_path is not None:
+                msg += f" in file {file_path}"
+            print(msg)
+            raise RuntimeError(msg)
+
+
 class ParquetVideoTextDataset(Dataset):
     """Efficient loader for video-text data from a directory of Parquet files."""
 
@@ -140,6 +161,9 @@ class ParquetVideoTextDataset(Dataset):
         processed = self._process_row(row_dict)
         lat, emb, mask, info = processed["latents"], processed[
             "embeddings"], processed["masks"], processed["info"]
+        check_nans(lat, "latents (parquet)", idx, file_path)
+        check_nans(emb, "embeddings (parquet)", idx, file_path)
+        check_nans(mask, "masks (parquet)", idx, file_path)
         if lat.numel() == 0:  # Validation parquet
             return lat, emb, mask, info
         else:
