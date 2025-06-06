@@ -122,7 +122,6 @@ class DenoisingStage(PipelineStage):
         # Prepare image latents and embeddings for I2V generation
         image_embeds = batch.image_embeds
         if len(image_embeds) > 0:
-            assert torch.isnan(image_embeds[0]).sum() == 0
             image_embeds = [
                 image_embed.to(target_dtype) for image_embed in image_embeds
             ]
@@ -154,11 +153,9 @@ class DenoisingStage(PipelineStage):
         # Get latents and embeddings
         latents = batch.latents
         prompt_embeds = batch.prompt_embeds
-        assert torch.isnan(prompt_embeds[0]).sum() == 0
         if batch.do_classifier_free_guidance:
             neg_prompt_embeds = batch.negative_prompt_embeds
             assert neg_prompt_embeds is not None
-            assert torch.isnan(neg_prompt_embeds[0]).sum() == 0
 
         # Run denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -173,7 +170,6 @@ class DenoisingStage(PipelineStage):
                     latent_model_input = torch.cat(
                         [latent_model_input, batch.image_latent],
                         dim=1).to(target_dtype)
-                assert torch.isnan(latent_model_input).sum() == 0
                 latent_model_input = self.scheduler.scale_model_input(
                     latent_model_input, t)
 

@@ -29,12 +29,6 @@ from fastvideo.v1.models.dits.base import CachableDiT
 from fastvideo.v1.platforms import _Backend
 
 
-def check_nans(tensor, name, rank):
-    if torch.isnan(tensor).any():
-        print(f"[WANVIDEO][RANK {rank}] WARNING: NaNs detected in {name} (shape: {tensor.shape})")
-        raise RuntimeError(f"[WANVIDEO][RANK {rank}] NaNs detected in {name} (shape: {tensor.shape})")
-
-
 class WanImageEmbedding(torch.nn.Module):
 
     def __init__(self, in_features: int, out_features: int):
@@ -301,8 +295,6 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        check_nans(hidden_states, "block input", rank)
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
@@ -316,13 +308,9 @@ class WanTransformerBlock(nn.Module):
         # 1. Self-attention
         norm_hidden_states = (self.norm1(hidden_states.float()) *
                               (1 + scale_msa) + shift_msa).to(orig_dtype)
-        check_nans(norm_hidden_states, "after norm1", rank)
         query, _ = self.to_q(norm_hidden_states)
-        check_nans(query, "after to_q", rank)
         key, _ = self.to_k(norm_hidden_states)
-        check_nans(key, "after to_k", rank)
         value, _ = self.to_v(norm_hidden_states)
-        check_nans(value, "after to_v", rank)
 
         if self.norm_q is not None:
             query = self.norm_q.forward_native(query)
@@ -340,7 +328,6 @@ class WanTransformerBlock(nn.Module):
                                            key, cos, sin, is_neox_style=False)
 
         attn_output, _ = self.attn1(query, key, value)
-        check_nans(attn_output, "after self-attn", rank)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -350,25 +337,20 @@ class WanTransformerBlock(nn.Module):
             hidden_states, attn_output, gate_msa, null_shift, null_scale)
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype), hidden_states.to(orig_dtype)
-        check_nans(hidden_states, "after self_attn_residual_norm", rank)
 
         # 2. Cross-attention
         attn_output = self.attn2(norm_hidden_states,
                                  context=encoder_hidden_states,
                                  context_lens=None)
-        check_nans(attn_output, "after cross-attn", rank)
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa)
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype), hidden_states.to(orig_dtype)
-        check_nans(hidden_states, "after cross_attn_residual_norm", rank)
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        check_nans(ff_output, "after ffn", rank)
         hidden_states = self.mlp_residual(hidden_states, ff_output, c_gate_msa)
         hidden_states = hidden_states.to(orig_dtype)
-        check_nans(hidden_states, "after mlp_residual", rank)
 
         return hidden_states
 
@@ -450,8 +432,6 @@ class WanTransformer3DModel(CachableDiT):
                     torch.Tensor, List[torch.Tensor]]] = None,
                 guidance=None,
                 **kwargs) -> torch.Tensor:
-        if dist.is_initialized() and dist.get_rank() == 0:
-            print(f"[MODEL WanTransformer3DModel] Input hidden_states shape: {hidden_states.shape}")
         forward_batch = get_forward_context().forward_batch
         enable_teacache = forward_batch is not None and forward_batch.enable_teacache
 
@@ -469,8 +449,6 @@ class WanTransformer3DModel(CachableDiT):
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
-        if dist.is_initialized() and dist.get_rank() == 0:
-            print(f"[MODEL WanTransformer3DModel] Post-patch calculated dims: T={post_patch_num_frames}, H={post_patch_height}, W={post_patch_width}")
 
         # Get rotary embeddings
         d = self.hidden_size // self.num_attention_heads
@@ -489,13 +467,7 @@ class WanTransformer3DModel(CachableDiT):
                      freqs_sin.float()) if freqs_cos is not None else None
 
         hidden_states = self.patch_embedding(hidden_states)
-        if dist.is_initialized() and dist.get_rank() == 0:
-            print(f"[MODEL WanTransformer3DModel] Shape after patch_embedding: {hidden_states.shape}")
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
-        if dist.is_initialized() and dist.get_rank() == 0:
-            print(f"[MODEL WanTransformer3DModel] Shape after flatten & transpose: {hidden_states.shape}")
-
-        check_nans(hidden_states, "hidden_states (after patch_embedding)", dist.get_rank() if dist.is_initialized() else 0)
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
             timestep, encoder_hidden_states, encoder_hidden_states_image)
@@ -531,13 +503,8 @@ class WanTransformer3DModel(CachableDiT):
             #        )
             #else:
             for block_idx, block in enumerate(self.blocks):
-                # print(f"[MODEL WanTransformer3DModel] Shape before block {block_idx}: {hidden_states.shape}")
                 hidden_states = block(hidden_states, encoder_hidden_states,
                                         timestep_proj, freqs_cis)
-                # if dist.is_initialized() and dist.get_rank() == 0:
-                #     print(f"[MODEL WanTransformer3DModel] Shape after block {block_idx}: {hidden_states.shape}")
-
-                check_nans(hidden_states, f"hidden_states (after block {block_idx})", dist.get_rank() if dist.is_initialized() else 0)
 
             # if teacache is enabled, we need to cache the original hidden states
             if enable_teacache:
@@ -546,32 +513,15 @@ class WanTransformer3DModel(CachableDiT):
         # 5. Output norm, projection & unpatchify
         shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2,
                                                                           dim=1)
-        if dist.is_initialized() and dist.get_rank() == 0:
-            print(f"[MODEL WanTransformer3DModel] Shape before norm_out: {hidden_states.shape}")
         hidden_states = self.norm_out(hidden_states.float(), shift, scale)
-        if dist.is_initialized() and dist.get_rank() == 0:
-            print(f"[MODEL WanTransformer3DModel] Shape after norm_out, before proj_out: {hidden_states.shape}")
         hidden_states = self.proj_out(hidden_states)
-        if dist.is_initialized() and dist.get_rank() == 0:
-            print(f"[MODEL WanTransformer3DModel] Shape after proj_out: {hidden_states.shape}")
-
-        check_nans(hidden_states, "hidden_states (after norm_out)", dist.get_rank() if dist.is_initialized() else 0)
-        check_nans(hidden_states, "hidden_states (after proj_out)", dist.get_rank() if dist.is_initialized() else 0)
 
         hidden_states = hidden_states.reshape(batch_size, post_patch_num_frames,
                                               post_patch_height,
                                               post_patch_width, p_t, p_h, p_w,
                                               -1)
-        if dist.is_initialized() and dist.get_rank() == 0:
-            print(f"[MODEL WanTransformer3DModel] Shape after reshape (unpatchify stage 1): {hidden_states.shape}")
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
-        if dist.is_initialized() and dist.get_rank() == 0:
-            print(f"[MODEL WanTransformer3DModel] Shape after permute (unpatchify stage 2): {hidden_states.shape}")
         output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
-        if dist.is_initialized() and dist.get_rank() == 0:
-            print(f"[MODEL WanTransformer3DModel] Final output shape: {output.shape}")
-
-        check_nans(output, "output (final output)", dist.get_rank() if dist.is_initialized() else 0)
 
         return output
 

@@ -31,16 +31,6 @@ logger = init_logger(__name__)
 # Manual gradient checking flag - set to True to enable gradient verification
 ENABLE_GRADIENT_CHECK = False
 
-def check_nans(tensor, name, rank):
-    if torch.isnan(tensor).any():
-        print(f"[RANK {rank}] WARNING: NaNs detected in {name} (shape: {tensor.shape})")
-        raise RuntimeError(f"[RANK {rank}] NaNs detected in {name} (shape: {tensor.shape})")
-
-def check_model_params_for_nans(model, rank):
-    for name, param in model.named_parameters():
-        if torch.isnan(param).any():
-            print(f"[RANK {rank}] WARNING: NaNs detected in parameter {name} (shape: {param.shape})")
-            raise RuntimeError(f"[RANK {rank}] NaNs detected in parameter {name} (shape: {param.shape})")
 
 class WanTrainingPipeline(TrainingPipeline):
     """
@@ -107,26 +97,12 @@ class WanTrainingPipeline(TrainingPipeline):
 
             latents, encoder_hidden_states, encoder_attention_mask, infos = batch
 
-            check_nans(latents, "latents (input batch)", self.rank)
-            check_nans(encoder_hidden_states, "encoder_hidden_states (input batch)", self.rank)
-            check_nans(encoder_attention_mask, "encoder_attention_mask (input batch)", self.rank)
-            if isinstance(infos, torch.Tensor):
-                check_nans(infos, "infos (input batch)", self.rank)
-
-            # logger.info("rank: %s, caption: %s",
-            #             self.rank,
-            #             infos['caption'],
-            #             local_main_process_only=False)
             # TODO(will): don't hardcode bfloat16
             latents = latents.to(self.training_args.device,
                                  dtype=torch.bfloat16)
             encoder_hidden_states = encoder_hidden_states.to(
                 self.training_args.device, dtype=torch.bfloat16)
-            if self.rank == 0:
-                print(f"[RANK {self.rank} - train_one_step] Initial latents shape after to(device): {latents.shape}")
             latents = normalize_dit_input(model_type, latents)
-            if self.rank == 0:
-                print(f"[RANK {self.rank} - train_one_step] Normalized latents shape: {latents.shape}")
             batch_size = latents.shape[0]
             noise = torch.randn_like(latents)
             u = compute_density_for_timestep_sampling(
@@ -152,10 +128,6 @@ class WanTrainingPipeline(TrainingPipeline):
                 dtype=latents.dtype,
             )
             noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
-            if self.rank == 0:
-                print(f"[RANK {self.rank} - train_one_step] noise shape: {noise.shape}")
-            if self.rank == 0:
-                print(f"[RANK {self.rank} - train_one_step] noisy_model_input shape: {noisy_model_input.shape}")
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 input_kwargs = {
                     "hidden_states": noisy_model_input,
@@ -172,22 +144,14 @@ class WanTrainingPipeline(TrainingPipeline):
                 with set_forward_context(current_timestep=timesteps,
                                          attn_metadata=None):
                     model_pred = transformer(**input_kwargs)
-                if self.rank == 0:
-                    print(f"[RANK {self.rank} - train_one_step] Raw model_pred shape from transformer: {model_pred.shape}")
 
                 if precondition_outputs:
                     model_pred = noisy_model_input - model_pred * sigmas
-                if self.rank == 0:
-                    print(f"[RANK {self.rank} - train_one_step] Final model_pred shape (after preconditioning if any): {model_pred.shape}")
                 target = latents if precondition_outputs else noise - latents
-                if self.rank == 0:
-                    print(f"[RANK {self.rank} - train_one_step] target shape: {target.shape}")
 
                 # Crop target to match model_pred's predicted dimensions
                 _, _, t_pred, h_pred, w_pred = model_pred.shape
                 target = target[:, :, :t_pred, :h_pred, :w_pred]
-                if self.rank == 0:
-                    print(f"[RANK {self.rank} - train_one_step] Cropped target shape: {target.shape}")
 
                 loss = (torch.mean((model_pred.float() - target.float())**2) /
                         gradient_accumulation_steps)
@@ -195,28 +159,9 @@ class WanTrainingPipeline(TrainingPipeline):
             loss.backward()
 
             avg_loss = loss.detach().clone()
-            # logger.info(f"rank: {self.rank}, avg_loss: {avg_loss.item()}",
-            #             local_main_process_only=False)
             world_group = get_world_group()
             world_group.all_reduce(avg_loss, op=torch.distributed.ReduceOp.AVG)
             total_loss += avg_loss.item()
-
-            # After normalization
-            check_nans(latents, "latents (after normalization)", self.rank)
-            # After noise creation
-            check_nans(noise, "noise", self.rank)
-            # After noisy_model_input
-            check_nans(noisy_model_input, "noisy_model_input", self.rank)
-            # After model_pred (after forward)
-            check_nans(model_pred, "model_pred (after forward)", self.rank)
-            # After target creation
-            check_nans(target, "target", self.rank)
-            # After loss computation
-            check_nans(loss, "loss", self.rank)
-            # After loss.backward(), check gradients
-            for name, param in transformer.named_parameters():
-                if param.grad is not None and torch.isnan(param.grad).any():
-                    print(f"[RANK {self.rank}] WARNING: NaNs detected in gradient of {name} (shape: {param.grad.shape})")
 
         # TODO(will): perhaps move this into transformer api so that we can do
         # the following:
