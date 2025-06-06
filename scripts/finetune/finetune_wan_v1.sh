@@ -28,6 +28,7 @@ torchrun --nnodes 1 --nproc_per_node $NUM_GPUS \
     --validation_prompt_dir "$VALIDATION_DIR" \
     --train_batch_size=1 \
     --num_latent_t 16 \
+    --num_gpus $NUM_GPUS \
     --dp_size 2 \
     --dp_shards 4 \
     --sp_size 4 \
@@ -42,7 +43,7 @@ torchrun --nnodes 1 --nproc_per_node $NUM_GPUS \
     --validation_steps 50 \
     --gradient_checkpointing \
     --validation_sampling_steps "2,4,8" \
-    --log_validation \
+    --log_validation False \
     --checkpoints_total_limit 3 \
     --allow_tf32 \
     --ema_start_step 0 \
